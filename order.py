@@ -215,17 +215,25 @@ async def dry_run(
     cart_id: str | None = None
     try:
         cart_id, item_id = await build_cart(client, config, server, assign=authenticated, steps=steps)
+        preview_ok = False
         if authenticated:
-            summary = await client.get(f"/order/cart/{cart_id}/checkout")
-            prices = summary.get("prices", {}) if isinstance(summary, dict) else {}
-            result.price = _amount(prices, "withoutTax")
-            result.price_with_tax = _amount(prices, "withTax")
-            steps.append("checkout preview read, no order placed")
-        else:
+            try:
+                summary = await client.get(f"/order/cart/{cart_id}/checkout")
+                prices = summary.get("prices", {}) if isinstance(summary, dict) else {}
+                result.price = _amount(prices, "withoutTax")
+                result.price_with_tax = _amount(prices, "withTax")
+                steps.append("checkout preview read, no order placed")
+                preview_ok = True
+            except OvhApiError as exc:
+                if exc.status != 400 or "is not available in" not in str(exc):
+                    raise
+                steps.append("checkout preview: out of stock right now (OVH checks stock at checkout), every step before it passed")
+        if not preview_ok:
             item = await client.get(f"/order/cart/{cart_id}/item/{item_id}")
             result.price = sum(float((p.get("price") or {}).get("value", 0) or 0)
                                for p in item.get("prices", []) if p.get("label") == "TOTAL")
-            steps.append("item price read (anonymous cart, checkout needs working keys)")
+            if not authenticated:
+                steps.append("item price read (anonymous cart, checkout needs working keys)")
         within = result.price is not None and 0 < result.price <= max_price
         steps.append(
             f"price {result.price:.2f} {config.currency} "

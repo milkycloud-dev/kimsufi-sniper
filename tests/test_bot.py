@@ -377,6 +377,26 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ovh.posted("/checkout"), [])
             self.assertEqual(bool(ovh.posted("/assign")), authed)
             self.assertIn(("DELETE", "/order/cart/c1", None), ovh.log)
+        class SoldOut(FakeOvh):
+            async def get(self, path, params=None):
+                if path.endswith("/checkout"):
+                    raise OvhApiError(400, "25skb012.ram is not available in gra", path)
+                return await super().get(path, params)
+
+        r = await dry_run(SoldOut(), Config(), s, 15.0, authenticated=True)
+        self.assertTrue(r.ok, r.steps)
+        self.assertEqual(r.price, 9.99)
+        self.assertTrue(any("out of stock right now" in st for st in r.steps))
+
+        class Broken(FakeOvh):
+            async def get(self, path, params=None):
+                if path.endswith("/checkout"):
+                    raise OvhApiError(400, "Missing customFields", path)
+                return await super().get(path, params)
+
+        r = await dry_run(Broken(), Config(), s, 15.0, authenticated=True)
+        self.assertFalse(r.ok)
+        self.assertIn("Missing customFields", r.error)
         r = await dry_run(FakeOvh(price=40.0), Config(), s, 15.0, authenticated=False)
         self.assertFalse(r.ok)
         self.assertIn("OUTSIDE", r.steps[-1])

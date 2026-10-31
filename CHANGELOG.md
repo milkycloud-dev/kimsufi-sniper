@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Dry run with working keys: when OVH rejects the checkout preview only because the server is out of stock, the run passes and says so, since every step before checkout succeeded. Other checkout errors still fail the run.
+
 ## 1.1.0
 
 - Any Kimsufi plan: live plan catalog in the panel for the account subsidiary, with monthly prices; plans can be watched or dropped with a tap and survive restarts.

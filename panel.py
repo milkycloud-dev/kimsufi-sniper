@@ -27,6 +27,7 @@ class Runtime:
     backoff: float = 0.0
     stock: dict[str, str] = field(default_factory=dict)
     last_stock_seen: float | None = None
+    ovh_status: str | None = None
 
 
 def fmt_time(ts: float | None) -> str:
@@ -99,8 +100,10 @@ class Panel:
         plans = len(self.state.active_plans())
         effective_mode = d["mode"]
         warn = ""
-        if effective_mode != "notify" and not self.config.has_ovh_credentials:
+        if effective_mode != "notify" and rt.ovh_status is None and not self.config.has_ovh_credentials:
             warn = "\n⚠️ OVH API keys are not set: the bot only notifies."
+        elif effective_mode != "notify" and rt.ovh_status and rt.ovh_status != "ok":
+            warn = f"\n⚠️ OVH API keys: {html.escape(rt.ovh_status)}"
         if effective_mode == "buy" and not self.config.allow_autopay:
             warn += "\n⚠️ Auto-buy is disabled on this deployment: reservations are made instead."
         if rt.stock:

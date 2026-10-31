@@ -13,7 +13,7 @@ import httpx
 from availability import FetchError, ServerAvailability, fetch_all, select
 from config import MAX_BACKOFF, Config, load_config
 from order import OrderResult, place_order
-from ovh_api import OvhClient
+from ovh_api import OvhApiError, OvhClient
 from panel import Panel, Runtime, fmt_time
 from state import State
 from telegram_bot import OwnerGate, TelegramApi, TelegramError
@@ -88,6 +88,7 @@ class Sniper:
             self.config.has_ovh_credentials, self.config.allow_autopay,
         )
         await self._setup_commands()
+        await self.check_ovh()
         await self.notify("startup", self._startup_text())
         tasks = [
             asyncio.create_task(self._poll_loop(), name="poll"),
@@ -107,9 +108,31 @@ class Sniper:
         if self.ovh:
             await self.ovh.close()
 
+    async def check_ovh(self) -> str | None:
+        if not self.ovh:
+            self.runtime.ovh_status = None
+            return None
+        try:
+            await self.ovh.get("/order/cart")
+            status = "ok"
+        except OvhApiError as exc:
+            status = f"cannot use carts ({exc.status}: {exc.args[0].split(': ', 1)[-1].split(' [')[0]})"
+        except Exception as exc:
+            status = f"check failed ({type(exc).__name__})"
+        changed = status != self.runtime.ovh_status
+        self.runtime.ovh_status = status
+        if status != "ok":
+            logger.warning("OVH keys: %s", status)
+            if changed and self.state.mode != "notify":
+                await self.notify("errors", f"⚠️ <b>OVH API keys</b>: {html.escape(status)}. Reservations will fail until the key is fixed.")
+        return status
+
     def _startup_text(self) -> str:
         names = ", ".join(self.config.plans[c] for c in self.state.active_plans()) or "none"
-        keys = "set" if self.config.has_ovh_credentials else "missing, notify only"
+        if not self.config.has_ovh_credentials:
+            keys = "missing, notify only"
+        else:
+            keys = self.runtime.ovh_status or "set"
         return (
             "🤖 <b>Kimsufi sniper started</b>\n"
             f"Mode: {self.state.mode}, every {self.state.interval} s, plans: {html.escape(names)}\n"
@@ -169,6 +192,8 @@ class Sniper:
     async def check_now(self) -> str:
         if not self.state.active_plans():
             return "No plans selected"
+        if self.ovh and self.runtime.ovh_status != "ok":
+            await self.check_ovh()
         try:
             current = await self.check_once()
         except FetchError as exc:

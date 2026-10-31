@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- OVH key check at start and on "Check now": a key that cannot use carts is reported in the panel and in Telegram right away, not only when stock appears.
+
 ## 1.0.1
 
 - Price limit and messages use the account currency (`PRICE_CURRENCY`, `MAX_PRICE`), so USD accounts on `ovh-ca` (subsidiaries WE and WS) show $11.10 for KS-B and $13.30 for KS-C correctly.

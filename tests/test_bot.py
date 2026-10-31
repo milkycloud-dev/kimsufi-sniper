@@ -502,6 +502,24 @@ class SniperTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("answers again", tg.sent[-1][1])
         self.assertEqual(sn.runtime.error_streak, 0)
 
+    async def test_ovh_key_check(self):
+        ovh = FakeOvh()
+        sn, tg = self.make(ovh=ovh, owner_id=OWNER)
+        self.assertEqual(await sn.check_ovh(), "ok")
+        self.assertEqual(tg.sent, [])
+
+        class NoRights(FakeOvh):
+            async def get(self, path, params=None):
+                raise OvhApiError(403, "This call has not been granted", "https://x/order/cart")
+
+        sn2, tg2 = self.make(ovh=NoRights(), owner_id=OWNER)
+        status = await sn2.check_ovh()
+        self.assertEqual(status, "cannot use carts (403: This call has not been granted)")
+        self.assertIn("Reservations will fail", tg2.sent[0][1])
+        await sn2.check_ovh()
+        self.assertEqual(len(tg2.sent), 1)
+        self.assertIn("cannot use carts", sn2.panel.render("main")[0])
+
     async def test_check_now_button(self):
         sn, tg = self.make(owner_id=OWNER)
         self.feed["25skc012"] = {"gra": "72H"}

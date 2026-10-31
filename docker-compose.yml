@@ -1,0 +1,27 @@
+services:
+  sniper:
+    build: .
+    image: kimsufi-sniper:local
+    container_name: kimsufi-sniper
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_PATH: /app/data/state.json
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: 0.5
+    cpu_shares: 128
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

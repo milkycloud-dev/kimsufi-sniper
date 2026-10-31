@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from config import EU_DATACENTERS, INTERVAL_CHOICES, PRICE_CHOICES, Config
+from config import DATACENTERS, INTERVAL_CHOICES, PRICE_CHOICES, REGIONS, Config, dc_region
 from state import NOTIFY_KEYS, NOTIFY_LABELS, State
 
 MODE_TEXT = {
@@ -28,6 +28,9 @@ class Runtime:
     stock: dict[str, str] = field(default_factory=dict)
     last_stock_seen: float | None = None
     ovh_status: str | None = None
+    seen_dcs: set[str] = field(default_factory=set)
+    catalog: list[tuple[str, str, float | None]] = field(default_factory=list)
+    catalog_error: str | None = None
 
 
 def fmt_time(ts: float | None) -> str:
@@ -56,12 +59,16 @@ class Panel:
         runtime: Runtime,
         on_change: Callable[[], None],
         on_check: Callable[[], Awaitable[str]],
+        on_catalog: Callable[[], Awaitable[None]] | None = None,
+        on_dry_run: Callable[[], Awaitable[str]] | None = None,
     ) -> None:
         self.config = config
         self.state = state
         self.runtime = runtime
         self._on_change = on_change
         self._on_check = on_check
+        self._on_catalog = on_catalog
+        self._on_dry_run = on_dry_run
 
     def render(self, view: str = "main") -> tuple[str, dict]:
         builder = {
@@ -69,6 +76,7 @@ class Panel:
             "interval": self._interval,
             "triggers": self._triggers,
             "dcs": self._dcs,
+            "catalog": self._catalog,
             "notify": self._notify,
             "buy": self._buy_confirm,
         }.get(view, self._main)
@@ -76,12 +84,12 @@ class Panel:
         return text, {"inline_keyboard": rows}
 
     def _plans_text(self) -> str:
-        names = [self.config.plans[c] for c in self.state.active_plans()]
+        names = [self.state.label(c) for c in self.state.active_plans()]
         return ", ".join(names) or "none selected"
 
     def _dcs_text(self) -> str:
         dcs = self.state.data["datacenters"]
-        return ", ".join(dc.upper() for dc in dcs) if dcs else "any EU"
+        return ", ".join(dc.upper() for dc in dcs) if dcs else f"any in {REGIONS[self.state.region]}"
 
     def _lock_text(self) -> str:
         now = time.time()
@@ -90,7 +98,7 @@ class Panel:
             return "none"
         parts = []
         for key, until in sorted(locks.items()):
-            name = "all plans" if key == "*" else self.config.plans.get(key, key)
+            name = "all plans" if key == "*" else self.state.label(key)
             parts.append(f"{name} until {fmt_time(until)}")
         return "; ".join(parts)
 
@@ -108,7 +116,7 @@ class Panel:
             warn += "\n⚠️ Auto-buy is disabled on this deployment: reservations are made instead."
         if rt.stock:
             stock = ", ".join(
-                f"{html.escape(self.config.plans.get(k.split('@')[0], k))} {html.escape(k.split('@')[1].upper())} ({html.escape(v)})"
+                f"{html.escape(self.state.label(k.split('@')[0]))} {html.escape(k.split('@')[1].upper())} ({html.escape(v)})"
                 for k, v in sorted(rt.stock.items())
             )
         else:
@@ -143,6 +151,7 @@ class Panel:
             ],
             [_btn(f"⏱ Interval: {d['interval']} s", "v:interval"), _btn("🎯 Triggers", "v:triggers")],
             [_btn("🔔 Notifications", "v:notify"), _btn("🔎 Check now", "chk")],
+            [_btn("📦 Plan catalog", "v:catalog"), _btn("🧪 Dry run", "dry")],
         ]
         if self._lock_text() != "none":
             rows.append([_btn("🔓 Clear reservation lock", "unlock")])
@@ -181,15 +190,17 @@ class Panel:
             "<b>Triggers</b>\n\n"
             "An alert or reservation fires when a selected plan turns in stock "
             "in a selected datacenter with an allowed delivery time and a price under the limit.\n\n"
-            f"Datacenters: <b>{self._dcs_text()}</b>\n"
+            f"Region: <b>{REGIONS[d['region']]}</b>, datacenters: <b>{self._dcs_text()}</b>\n"
             f"Price limit: <b>{d['max_price']:.2f} {self.config.currency}</b> excl. tax (checked in the cart before ordering)\n"
+            "More plans: Plan catalog on the main screen.\n"
             "One server only: after one successful reservation all plans are locked "
             f"for {self.config.reserve_cooldown_hours} h; off locks only the reserved plan."
         )
         rows = [
             [_btn(f"{_mark(d['plans'].get(code, False))} {label} ({code})", f"p:{code}")]
-            for code, label in self.config.plans.items()
+            for code, label in self.state.all_plans().items()
         ]
+        rows.append([_btn(f"🌍 Region: {REGIONS[d['region']]}", "rg")])
         rows.append([_btn(f"📍 Datacenters: {self._dcs_text()}", "v:dcs")])
         rows.append([_btn(
             "⚡ Delivery: 1H only" if d["speed"] == "fast" else "⚡ Delivery: any (1H to 72H)", "sp"
@@ -199,24 +210,70 @@ class Panel:
         rows.append([_btn("← Back", "v:main")])
         return text, rows
 
+    def _known_dcs(self) -> list[str]:
+        order = {"eu": 0, "na": 1, "apac": 2, "other": 3}
+        dcs = set(DATACENTERS) | set(self.runtime.seen_dcs) | set(self.state.data["datacenters"])
+        return sorted(dcs, key=lambda dc: (order.get(dc_region(dc), 3), dc))
+
     def _dcs(self) -> tuple[str, list]:
         selected = set(self.state.data["datacenters"])
+        region = REGIONS[self.state.region]
+        groups = []
+        for key, name in REGIONS.items():
+            if key == "all":
+                continue
+            codes = [dc.upper() for dc in self._known_dcs() if dc_region(dc) == key]
+            if codes:
+                groups.append(f"{name}: {', '.join(codes)}")
         text = (
             "<b>Datacenters</b>\n\n"
-            "Nothing selected means any EU datacenter. "
-            "KS-B and KS-C are currently listed only in GRA."
+            f"Nothing selected means any datacenter in the region ({region}). "
+            "Selected datacenters override the region. "
+            "Each plan is sold only in some of them; the dry run shows which.\n\n"
+            + "\n".join(groups)
         )
-        rows = [[_btn(f"{_mark(not selected)} Any EU", "dc:*")]]
+        rows = [[_btn(f"{_mark(not selected)} Any in {region}", "dc:*")]]
         row = []
-        for dc in EU_DATACENTERS:
+        for dc in self._known_dcs():
             row.append(_btn(f"{'✅ ' if dc in selected else ''}{dc.upper()}", f"dc:{dc}"))
-            if len(row) == 4:
+            if len(row) == 3:
                 rows.append(row)
                 row = []
         if row:
             rows.append(row)
         rows.append([_btn("← Back", "v:triggers")])
         return text, rows
+
+    def _catalog(self) -> tuple[str, list]:
+        rt = self.runtime
+        watched = self.state.all_plans()
+        active = set(self.state.active_plans())
+        limit = float(self.state.data["max_price"])
+        cur = self.config.currency
+        lines = [
+            "<b>Plan catalog</b>\n",
+            f"Kimsufi plans of the OVH catalog for subsidiary {html.escape(self.config.ovh_subsidiary)}, "
+            f"monthly price excl. tax in {html.escape(cur)}. Tap a plan to watch it or stop watching it. "
+            "Plans ending in SGP or SYD are sold in Asia-Pacific; set the region or datacenters to match.",
+        ]
+        if rt.catalog_error:
+            lines.append(f"\n⚠️ Catalog not loaded: {html.escape(rt.catalog_error)}")
+        over = [label for code, label, price in rt.catalog if code in active and price and price > limit]
+        if over:
+            lines.append(f"\n⚠️ Above the price limit {limit:.2f} {cur}: {html.escape(', '.join(over))}")
+        rows = []
+        row = []
+        for code, label, price in rt.catalog:
+            mark = "✅ " if code in active else ("▫️ " if code in watched else "")
+            price_text = f" {price:.2f}" if price is not None else ""
+            row.append(_btn(f"{mark}{label}{price_text}", f"pc:{code}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([_btn("↻ Reload catalog", "cat"), _btn("← Back", "v:main")])
+        return "\n".join(lines), rows
 
     def _notify(self) -> tuple[str, list]:
         text = "<b>Notifications</b>\n\nAll are on by default. Messages go only to the owner."
@@ -241,7 +298,28 @@ class Panel:
         kind, _, arg = data.partition(":")
 
         if kind == "v":
+            if arg == "catalog" and not self.runtime.catalog and self._on_catalog:
+                await self._on_catalog()
             return arg or "main", None
+
+        if kind == "cat" and self._on_catalog:
+            await self._on_catalog()
+            return "catalog", "Catalog reloaded" if not self.runtime.catalog_error else "Catalog failed"
+
+        if kind == "dry" and self._on_dry_run:
+            return "main", await self._on_dry_run()
+
+        if kind == "pc" and arg:
+            label = next((lb for code, lb, _ in self.runtime.catalog if code == arg), None)
+            if label is None and arg not in self.state.all_plans():
+                return "catalog", None
+            on = self.state.toggle_plan(arg, label)
+            return self._commit("catalog", f"{label or arg}: {'watched' if on else 'not watched'}")
+
+        if kind == "rg":
+            keys = list(REGIONS)
+            d["region"] = keys[(keys.index(d["region"]) + 1) % len(keys)]
+            return self._commit("triggers", f"Region: {REGIONS[d['region']]}")
 
         if kind == "chk":
             return "main", await self._on_check()
@@ -266,17 +344,17 @@ class Panel:
             d["interval"] = int(arg)
             return self._commit("interval", f"Interval: {arg} s")
 
-        if kind == "p" and arg in self.config.plans:
+        if kind == "p" and arg in self.state.all_plans():
             d["plans"][arg] = not d["plans"].get(arg, False)
             return self._commit("triggers")
 
         if kind == "dc":
             if arg == "*":
                 d["datacenters"] = []
-            elif arg in EU_DATACENTERS:
+            elif arg in self._known_dcs():
                 dcs = set(d["datacenters"])
                 dcs.symmetric_difference_update({arg})
-                d["datacenters"] = [dc for dc in EU_DATACENTERS if dc in dcs]
+                d["datacenters"] = [dc for dc in self._known_dcs() if dc in dcs]
             return self._commit("dcs")
 
         if kind == "sp":

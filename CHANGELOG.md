@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Any Kimsufi plan: live plan catalog in the panel for the account subsidiary, with monthly prices; plans can be watched or dropped with a tap and survive restarts.
+- Any location: region filter (Europe, North America, Asia-Pacific, worldwide) and datacenters in every region, including zones that appear later such as `eu-west-par-*`.
+- Orders outside Europe: the datacenter is checked against what the plan is offered in, the `region` value is chosen per datacenter, and traffic options of Asia-Pacific plans are added.
+- Dry run in the panel and as `python main.py --dry-run [plan[@dc] ...]`: builds a real cart, reads the price, deletes the cart, never checks out.
+- Defaults are unchanged: KS-B and KS-C in Europe, reserve mode, 5 s interval.
+
 ## 1.0.2
 
 - OVH key check at start and on "Check now": a key that cannot use carts is reported in the panel and in Telegram right away, not only when stock appears.

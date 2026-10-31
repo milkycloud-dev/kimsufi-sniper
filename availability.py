@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from config import EU_DATACENTERS, EXCLUDED_REGIONS
+from config import dc_region
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,6 @@ class ServerAvailability:
         return f"{self.plan_code} @ {self.datacenter} ({self.availability})"
 
 
-def is_eu(dc: str) -> bool:
-    return dc in EU_DATACENTERS and dc not in EXCLUDED_REGIONS
-
-
 def parse(data: list[dict]) -> list[ServerAvailability]:
     results: list[ServerAvailability] = []
     for entry in data:
@@ -60,7 +56,7 @@ def parse(data: list[dict]) -> list[ServerAvailability]:
         fqn = str(entry.get("fqn", ""))
         for dc_info in entry.get("datacenters", []) or []:
             dc = str(dc_info.get("datacenter", "")).lower()
-            if not is_eu(dc):
+            if not dc:
                 continue
             results.append(ServerAvailability(plan_code, fqn, dc, str(dc_info.get("availability", ""))))
     return results
@@ -96,17 +92,23 @@ async def fetch_all(http: httpx.AsyncClient, plan_codes: list[str]) -> list[Serv
     return [item for part in parts for item in part]
 
 
+def matches_location(dc: str, datacenters: list[str], region: str) -> bool:
+    if datacenters:
+        return dc in datacenters
+    return region == "all" or dc_region(dc) == region
+
+
 def select(
     entries: list[ServerAvailability],
     datacenters: list[str],
     speed: str,
+    region: str = "eu",
 ) -> list[ServerAvailability]:
-    wanted = set(datacenters)
     out = []
     for s in entries:
         if not in_stock(s.availability):
             continue
-        if wanted and s.datacenter not in wanted:
+        if not matches_location(s.datacenter, datacenters, region):
             continue
         if speed == "fast" and not is_fast(s.availability):
             continue

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import re
 import logging
 import os
 import signal
@@ -10,9 +11,9 @@ import time
 
 import httpx
 
-from availability import FetchError, ServerAvailability, fetch_all, select
+from availability import FetchError, ServerAvailability, fetch_all, matches_location, select
 from config import MAX_BACKOFF, Config, load_config
-from order import OrderResult, place_order
+from order import DryRunResult, OrderResult, dry_run, place_order
 from ovh_api import OvhApiError, OvhClient
 from panel import Panel, Runtime, fmt_time
 from state import State
@@ -45,7 +46,10 @@ class Sniper:
         self.tg = tg or TelegramApi(config.telegram_bot_token)
         self.ovh = ovh if ovh is not None else (OvhClient(config) if config.has_ovh_credentials else None)
         self.gate = OwnerGate(config.owner_id, config.owner_username)
-        self.panel = Panel(config, self.state, self.runtime, self.wake, self.check_now)
+        self.panel = Panel(
+            config, self.state, self.runtime, self.wake, self.check_now,
+            on_catalog=self.load_catalog, on_dry_run=self.start_dry_run,
+        )
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._check_lock = asyncio.Lock()
@@ -128,7 +132,7 @@ class Sniper:
         return status
 
     def _startup_text(self) -> str:
-        names = ", ".join(self.config.plans[c] for c in self.state.active_plans()) or "none"
+        names = ", ".join(self.state.label(c) for c in self.state.active_plans()) or "none"
         if not self.config.has_ovh_credentials:
             keys = "missing, notify only"
         else:
@@ -171,6 +175,7 @@ class Sniper:
         async with self._check_lock:
             entries = await fetch_all(self.http, self.state.active_plans())
             rt = self.runtime
+            rt.seen_dcs.update(s.datacenter for s in entries)
             rt.checks += 1
             rt.last_check = time.time()
             if rt.error_streak:
@@ -182,7 +187,7 @@ class Sniper:
                 self._error_alerted = False
             current = {
                 s.key: s
-                for s in select(entries, self.state.data["datacenters"], self.state.data["speed"])
+                for s in select(entries, self.state.data["datacenters"], self.state.data["speed"], self.state.region)
             }
             await self._process(current)
             if rt.checks % 720 == 0:
@@ -220,7 +225,7 @@ class Sniper:
             )
 
     def _name(self, s: ServerAvailability) -> str:
-        return f"{self.config.plans.get(s.plan_code, s.plan_code)} ({s.plan_code}) {s.datacenter.upper()}"
+        return f"{self.state.label(s.plan_code)} ({s.plan_code}) {s.datacenter.upper()}"
 
     async def _process(self, current: dict[str, ServerAvailability]) -> None:
         prev = self._prev if self._prev is not None else {}
@@ -268,7 +273,7 @@ class Sniper:
         return "\n".join(lines)
 
     def _candidates(self, servers: list[ServerAvailability], now: float) -> list[ServerAvailability]:
-        order = list(self.config.plans)
+        order = list(self.state.all_plans())
         out = []
         for s in sorted(servers, key=lambda x: (order.index(x.plan_code) if x.plan_code in order else 99, x.datacenter)):
             if self.state.lock_until(s.plan_code, now):
@@ -331,6 +336,112 @@ class Sniper:
             f"{retry}\n"
             f'<a href="{MANUAL_URL}">Order manually</a>'
         )
+
+    async def load_catalog(self) -> None:
+        rt = self.runtime
+        try:
+            resp = await self.http.get(
+                f"{self.config.ovh_api_base}/order/catalog/public/eco",
+                params={"ovhSubsidiary": self.config.ovh_subsidiary},
+            )
+            resp.raise_for_status()
+            plans = resp.json().get("plans", [])
+        except (httpx.HTTPError, ValueError) as exc:
+            rt.catalog_error = f"{type(exc).__name__}: {exc}"[:200]
+            logger.warning("Catalog load failed: %s", rt.catalog_error)
+            return
+        items = []
+        for plan in plans:
+            code = str(plan.get("planCode", "")).lower()
+            name = str(plan.get("invoiceName", ""))
+            if "sk" not in code or not name.upper().startswith("KS"):
+                continue
+            label = name.split("|")[0].strip()
+            suffix = re.search(r"-(sgp|syd|ynm|bhs)$", code)
+            if suffix:
+                label += f" {suffix.group(1).upper()}"
+            price = None
+            for pricing in plan.get("pricings", []):
+                if pricing.get("interval") == 1 and pricing.get("mode") == "default" and "renew" in pricing.get("capacities", []):
+                    price = pricing.get("price", 0) / 1e8
+                    break
+            items.append((code, label, price))
+        items.sort(key=lambda x: (x[2] if x[2] is not None else 1e9, x[1]))
+        rt.catalog = items
+        rt.catalog_error = None
+
+    async def dry_run_targets(self, plans: list[str]) -> tuple[list[ServerAvailability], list[str]]:
+        codes = list(dict.fromkeys(p.split("@", 1)[0] for p in plans))
+        entries = await fetch_all(self.http, codes)
+        self.runtime.seen_dcs.update(s.datacenter for s in entries)
+        targets: list[ServerAvailability] = []
+        notes: list[str] = []
+        for code in plans:
+            want_dc = None
+            if "@" in code:
+                code, want_dc = code.split("@", 1)
+            rows = [s for s in entries if s.plan_code == code]
+            if want_dc:
+                pick = next((s for s in rows if s.datacenter == want_dc), None)
+                if pick is None:
+                    fqn = rows[0].fqn if rows else code
+                    pick = ServerAvailability(code, fqn, want_dc, "dry-run")
+            else:
+                pick = next((s for s in rows if matches_location(
+                    s.datacenter, self.state.data["datacenters"], self.state.region)), None)
+            if pick is None:
+                listed = ", ".join(sorted({s.datacenter.upper() for s in rows})) or "none"
+                notes.append(f"{self.state.label(code)} ({code}): no datacenter matches the filters (listed: {listed})")
+                continue
+            targets.append(pick)
+        return targets, notes
+
+    async def run_dry_run(self, plans: list[str] | None = None) -> tuple[list[DryRunResult], list[str]]:
+        plans = plans or self.state.active_plans()
+        targets, notes = await self.dry_run_targets([p.lower() for p in plans])
+        authed = bool(self.ovh) and await self.check_ovh() == "ok"
+        client = self.ovh if authed else OvhClient(self.config, anonymous=True)
+        results = []
+        try:
+            for server in targets:
+                results.append(await dry_run(client, self.config, server, float(self.state.data["max_price"]), authed))
+        finally:
+            if not authed:
+                await client.close()
+        return results, notes
+
+    def dry_run_text(self, results: list[DryRunResult], notes: list[str]) -> str:
+        ok = sum(1 for r in results if r.ok)
+        lines = [f"🧪 <b>Dry run</b>: {ok}/{len(results)} passed, no order was placed"]
+        for r in results:
+            head = "✅" if r.ok else "❌"
+            lines.append(f"\n{head} <b>{html.escape(self._name(r.server))}</b> ({html.escape(r.server.availability)})")
+            for step in r.steps:
+                lines.append(f"• {html.escape(step)}")
+            if r.error and r.error != "price outside the limit":
+                lines.append(f"• error: {html.escape(r.error)}")
+        for note in notes:
+            lines.append(f"\n⚠️ {html.escape(note)}")
+        if results and not results[0].authenticated:
+            lines.append("\nKeys cannot use carts, so the run used an anonymous cart: assign and checkout were skipped.")
+        return "\n".join(lines)
+
+    async def start_dry_run(self) -> str:
+        chat = self.owner_chat
+
+        async def job() -> None:
+            try:
+                results, notes = await self.run_dry_run()
+                text = self.dry_run_text(results, notes)
+            except FetchError as exc:
+                text = f"🧪 <b>Dry run</b> failed: {html.escape(str(exc))}"
+            if chat is not None:
+                await self.tg.send(chat, text)
+
+        if not self.state.active_plans():
+            return "No plans selected"
+        asyncio.create_task(job())
+        return "Dry run started, report follows"
 
     async def _daily_loop(self) -> None:
         while not self._stop.is_set():
@@ -418,9 +529,22 @@ def setup_logging(level: str) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+async def dry_run_cli(config: Config, plans: list[str]) -> int:
+    sniper = Sniper(config)
+    try:
+        results, notes = await sniper.run_dry_run(plans or None)
+        text = sniper.dry_run_text(results, notes)
+        print(html.unescape(re.sub(r"<[^>]+>", "", text)))
+        return 0 if results and all(r.ok for r in results) and not notes else 1
+    finally:
+        await sniper.close()
+
+
 async def main() -> None:
     config = load_config()
     setup_logging(config.log_level)
+    if len(sys.argv) > 1 and sys.argv[1] == "--dry-run":
+        raise SystemExit(await dry_run_cli(config, sys.argv[2:]))
     if config.nice and hasattr(os, "nice"):
         os.nice(config.nice)
     sniper = Sniper(config)

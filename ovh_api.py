@@ -26,7 +26,8 @@ class OvhClient:
     Auth docs: https://help.ovhcloud.com/csm/en-gb-api-getting-started-ovhcloud-api
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, anonymous: bool = False) -> None:
+        self._anonymous = anonymous
         self._app_key = config.ovh_app_key
         self._app_secret = config.ovh_app_secret
         self._consumer_key = config.ovh_consumer_key
@@ -76,10 +77,13 @@ class OvhClient:
         data: dict | None = None,
         params: dict | None = None,
     ) -> Any:
+        url = f"{self._base_url}{path}"
+        if self._anonymous:
+            resp = await self._http.request(method, url, json=data, params=params)
+            return self._result(resp, url)
+
         if self._time_delta is None:
             await self._sync_time()
-
-        url = f"{self._base_url}{path}"
 
         # Build full URL with query string for signature
         request = self._http.build_request(
@@ -101,7 +105,10 @@ class OvhClient:
         resp = await self._http.request(
             method, url, json=data, params=params, headers=headers,
         )
+        return self._result(resp, full_url)
 
+    @staticmethod
+    def _result(resp: httpx.Response, full_url: str) -> Any:
         if resp.status_code >= 400:
             try:
                 err = resp.json().get("message", resp.text)

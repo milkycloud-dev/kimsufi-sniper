@@ -15,9 +15,9 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from availability import FetchError, ServerAvailability, fetch_all, fetch_plan, in_stock, is_fast, parse, select
-from config import Config, _plans, load_config
+from config import Config, _plans, dc_region, load_config
 from main import ERROR_ALERT_STREAK, MAX_ATTEMPTS, Sniper
-from order import pick_options, place_order
+from order import dry_run, pick_options, pick_region, place_order
 from ovh_api import OvhApiError
 from state import State
 from telegram_bot import OwnerGate
@@ -26,6 +26,21 @@ OWNER = 111
 STRANGER = 222
 FQN_B = "25skb012.ram-32g-ecc-1333.noraid-1x120ssd"
 FQN_C = "25skc012.ram-32g-ecc-1333.noraid-1x120ssd"
+
+
+def _plan(code, name, price):
+    return {"planCode": code, "invoiceName": name, "pricings": [
+        {"interval": 1, "mode": "default", "capacities": ["installation", "renew"], "price": int(price * 1e8)},
+    ]}
+
+
+CATALOG = [
+    _plan("24sk302-sgp", "KS-3 | Intel Xeon-E3 1245 v5", 21.1),
+    _plan("25skb012", "KS-B | Intel Xeon E5-1620v2", 11.1),
+    _plan("24sk302", "KS-3 | Intel Xeon-E3 1245 v5", 21.1),
+    _plan("25skc012", "KS-C | Intel Xeon E5-1650v2", 13.3),
+    _plan("26rise01", "RISE-1 | something", 50.0),
+]
 
 
 def feed(plan: str, fqn: str, dcs: dict[str, str]) -> list[dict]:
@@ -108,6 +123,8 @@ class FakeOvh:
             ]
         if path.endswith("/checkout"):
             return {"prices": {"withoutTax": {"value": self.price}, "withTax": {"value": round(self.price * 1.23, 2)}}}
+        if "/item/" in path:
+            return {"prices": [{"label": "TOTAL", "price": {"value": self.price}}]}
         return {}
 
     async def delete(self, path):
@@ -160,9 +177,31 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(is_fast("available"))
         self.assertFalse(is_fast("72H"))
 
-    def test_parse_eu_only(self):
-        data = feed("25skb012", FQN_B, {"gra": "1H-low", "bhs": "1H-low", "syd": "1H-low", "xyz": "1H-low"})
-        self.assertEqual([s.datacenter for s in parse(data)], ["gra"])
+    def test_parse_keeps_all_and_region_filters(self):
+        data = feed("24sk302", "24sk302.x", {
+            "gra": "1H-low", "eu-west-par-a": "24H", "bhs": "1H-low", "ca-east-tor-a": "72H", "syd": "1H-low", "ynm": "1H",
+        })
+        entries = parse(data)
+        self.assertEqual(len(entries), 6)
+        self.assertEqual([s.datacenter for s in select(entries, [], "any")], ["gra", "eu-west-par-a"])
+        self.assertEqual([s.datacenter for s in select(entries, [], "any", "na")], ["bhs", "ca-east-tor-a"])
+        self.assertEqual([s.datacenter for s in select(entries, [], "any", "apac")], ["syd", "ynm"])
+        self.assertEqual(len(select(entries, [], "any", "all")), 6)
+        self.assertEqual([s.datacenter for s in select(entries, ["bhs", "syd"], "any", "eu")], ["bhs", "syd"])
+
+    def test_dc_region(self):
+        self.assertEqual(dc_region("gra"), "eu")
+        self.assertEqual(dc_region("eu-west-par-c"), "eu")
+        self.assertEqual(dc_region("BHS"), "na")
+        self.assertEqual(dc_region("us-east-vin-a"), "na")
+        self.assertEqual(dc_region("sgp"), "apac")
+        self.assertEqual(dc_region("zzz"), "other")
+
+    def test_pick_region(self):
+        self.assertEqual(pick_region("gra", ["canada", "europe"]), "europe")
+        self.assertEqual(pick_region("bhs", ["canada", "europe"]), "canada")
+        self.assertEqual(pick_region("sgp", ["canada"]), "canada")
+        self.assertEqual(pick_region("syd", ["europe", "asia"]), "asia")
 
     def test_select(self):
         entries = [
@@ -319,6 +358,29 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ovh.posted("/checkout"), [])
         self.assertIn(("DELETE", "/order/cart/c1", None), ovh.log)
 
+    async def test_datacenter_not_offered(self):
+        ovh = FakeOvh()
+        s = ServerAvailability("25skb012", FQN_B, "bhs", "1H-low")
+        r = await place_order(ovh, Config(), s, 15.0, autopay=False)
+        self.assertFalse(r.success)
+        self.assertIn("not offered", r.error)
+        self.assertEqual(ovh.posted("/checkout"), [])
+        self.assertIn(("DELETE", "/order/cart/c1", None), ovh.log)
+
+    async def test_dry_run_never_checks_out(self):
+        for authed in (True, False):
+            ovh = FakeOvh()
+            s = ServerAvailability("25skb012", FQN_B, "gra", "unavailable")
+            r = await dry_run(ovh, Config(), s, 15.0, authenticated=authed)
+            self.assertTrue(r.ok, r.steps)
+            self.assertEqual(r.price, 9.99)
+            self.assertEqual(ovh.posted("/checkout"), [])
+            self.assertEqual(bool(ovh.posted("/assign")), authed)
+            self.assertIn(("DELETE", "/order/cart/c1", None), ovh.log)
+        r = await dry_run(FakeOvh(price=40.0), Config(), s, 15.0, authenticated=False)
+        self.assertFalse(r.ok)
+        self.assertIn("OUTSIDE", r.steps[-1])
+
     async def test_api_error_cleans_cart(self):
         ovh = FakeOvh(fail_on="/eco/options")
         s = ServerAvailability("25skb012", FQN_B, "gra", "1H-low")
@@ -336,9 +398,12 @@ class SniperTests(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request):
             if self.status != 200:
                 return httpx.Response(self.status)
+            if request.url.path.endswith("/catalog/public/eco"):
+                self.catalog_subsidiary = request.url.params.get("ovhSubsidiary")
+                return httpx.Response(200, json={"plans": CATALOG})
             code = request.url.params["planCode"]
-            fqn = FQN_B if code == "25skb012" else FQN_C
-            return httpx.Response(200, json=feed(code, fqn, self.feed[code]))
+            fqn = {"25skb012": FQN_B, "25skc012": FQN_C}.get(code, code + ".ram.disk")
+            return httpx.Response(200, json=feed(code, fqn, self.feed.get(code, {"gra": "unavailable"})))
 
         self.handler = handler
 
@@ -501,6 +566,109 @@ class SniperTests(unittest.IsolatedAsyncioTestCase):
         await sn.check_once()
         self.assertIn("answers again", tg.sent[-1][1])
         self.assertEqual(sn.runtime.error_streak, 0)
+
+    async def test_defaults_unchanged(self):
+        sn, tg = self.make(owner_id=OWNER)
+        d = sn.state.data
+        self.assertEqual(
+            (d["mode"], d["interval"], d["region"], d["datacenters"], d["speed"], d["max_price"], d["one_server"], d["enabled"]),
+            ("reserve", 5, "eu", [], "any", 15.0, True, True),
+        )
+        self.assertEqual(sn.state.active_plans(), ["25skb012", "25skc012"])
+        self.assertEqual(d["custom_plans"], {})
+        self.assertTrue(all(d["notify"].values()))
+        self.feed["25skb012"] = {"bhs": "1H-low", "syd": "1H-low"}
+        await sn.check_once()
+        self.assertEqual(tg.sent, [])
+        self.feed["25skb012"] = {"bhs": "1H-low", "gra": "24H"}
+        await sn.check_once()
+        self.assertEqual(sn.runtime.stock, {"25skb012@gra": "24H"})
+
+    async def test_region_and_datacenters(self):
+        sn, tg = self.make(owner_id=OWNER)
+        self.feed["25skb012"] = {"bhs": "1H-low", "syd": "24H", "gra": "unavailable"}
+        await sn.handle_update(cbq(OWNER, "rg"))
+        self.assertEqual(sn.state.region, "na")
+        await sn.check_once()
+        self.assertEqual(sn.runtime.stock, {"25skb012@bhs": "1H-low"})
+        for _ in range(2):
+            await sn.handle_update(cbq(OWNER, "rg"))
+        self.assertEqual(sn.state.region, "all")
+        await sn.check_once()
+        self.assertEqual(set(sn.runtime.stock), {"25skb012@bhs", "25skb012@syd"})
+        await sn.handle_update(cbq(OWNER, "rg"))
+        self.assertEqual(sn.state.region, "eu")
+        await sn.handle_update(cbq(OWNER, "dc:syd"))
+        self.assertEqual(sn.state.data["datacenters"], ["syd"])
+        await sn.check_once()
+        self.assertEqual(sn.runtime.stock, {"25skb012@syd": "24H"})
+        await sn.handle_update(cbq(OWNER, "v:dcs"))
+        self.assertIn("SYD", tg.edits[-1][2])
+        await sn.handle_update(cbq(OWNER, "dc:not-a-dc"))
+        self.assertEqual(sn.state.data["datacenters"], ["syd"])
+
+    async def test_catalog_adds_any_plan_and_persists(self):
+        sn, tg = self.make(owner_id=OWNER, ovh_subsidiary="WE", currency="USD")
+        await sn.handle_update(cbq(OWNER, "v:catalog"))
+        self.assertEqual(self.catalog_subsidiary, "WE")
+        codes = [c for c, _, _ in sn.runtime.catalog]
+        self.assertEqual(codes, ["25skb012", "25skc012", "24sk302", "24sk302-sgp"])
+        self.assertEqual(sn.runtime.catalog[3][1], "KS-3 SGP")
+        await sn.handle_update(cbq(OWNER, "pc:24sk302-sgp"))
+        self.assertIn("24sk302-sgp", sn.state.active_plans())
+        self.assertIn("Above the price limit", tg.edits[-1][2])
+        await sn.handle_update(cbq(OWNER, "pc:25skc012"))
+        self.assertNotIn("25skc012", sn.state.active_plans())
+        self.assertIn("25skc012", sn.state.all_plans())
+        await sn.handle_update(cbq(OWNER, "pc:unknown"))
+        self.assertNotIn("unknown", sn.state.all_plans())
+        st2 = State(sn.config)
+        self.assertEqual(st2.active_plans(), ["25skb012", "24sk302-sgp"])
+        self.assertEqual(st2.label("24sk302-sgp"), "KS-3 SGP")
+        await sn.handle_update(cbq(OWNER, "p:24sk302-sgp"))
+        self.assertNotIn("24sk302-sgp", sn.state.active_plans())
+        self.assertIn("24sk302-sgp", sn.state.all_plans())
+        await sn.handle_update(cbq(OWNER, "pc:24sk302-sgp"))
+        self.assertNotIn("24sk302-sgp", sn.state.all_plans())
+        self.feed["24sk302"] = {"sgp": "1H-low"}
+        sn.state.toggle_plan("24sk302", "KS-3")
+        sn.state.data["region"] = "apac"
+        await sn.check_once()
+        self.assertIn("KS-3 (24sk302) SGP", tg.sent[-1][1])
+
+    async def test_dry_run_from_panel(self):
+        ovh = FakeOvh()
+        sn, tg = self.make(ovh=ovh, owner_id=OWNER)
+        sn.runtime.ovh_status = "ok"
+        await sn.handle_update(cbq(OWNER, "dry"))
+        self.assertIn("Dry run started", tg.answers[-1][1])
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if any("Dry run" in t for _, t, _ in tg.sent):
+                break
+        report = [t for _, t, _ in tg.sent if "Dry run" in t][0]
+        self.assertIn("2/2 passed", report)
+        self.assertEqual(ovh.posted("/checkout"), [])
+        self.assertEqual(len(ovh.posted("/assign")), 2)
+
+    async def test_dry_run_targets_and_anonymous(self):
+        sn, tg = self.make(owner_id=OWNER)
+        self.feed["25skc012"] = {"bhs": "unavailable"}
+        seen = []
+        handler = self.handler
+
+        def spy(request):
+            seen.append(request.url.params.get("planCode"))
+            return handler(request)
+
+        sn.http._transport = httpx.MockTransport(spy)
+        targets, notes = await sn.dry_run_targets(["25skb012", "25skc012", "25skb012@bhs"])
+        self.assertEqual(sorted(seen), ["25skb012", "25skc012"])
+        self.assertEqual([t.key for t in targets], ["25skb012@gra", "25skb012@bhs"])
+        self.assertEqual(targets[1].fqn, FQN_B)
+        self.assertIn("no datacenter matches", notes[0])
+        self.assertIsNone(sn.ovh)
+        self.assertEqual(sn.dry_run_text([], notes).count("⚠️"), 1)
 
     async def test_ovh_key_check(self):
         ovh = FakeOvh()

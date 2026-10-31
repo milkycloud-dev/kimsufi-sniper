@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import INTERVAL_CHOICES, MODES, Config
+from config import INTERVAL_CHOICES, MODES, REGIONS, Config
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,9 @@ def defaults(config: Config) -> dict[str, Any]:
         "mode": config.default_mode,
         "interval": config.default_interval,
         "plans": {code: True for code in config.plans},
+        "region": config.default_region,
         "datacenters": [],
+        "custom_plans": {},
         "speed": "any",
         "max_price": config.default_max_price,
         "one_server": True,
@@ -60,8 +62,15 @@ class State:
         except (OSError, ValueError) as exc:
             logger.error("State file unreadable, using defaults: %s", exc)
             return
+        custom = saved.get("custom_plans")
+        if isinstance(custom, dict):
+            self.data["custom_plans"] = {
+                str(k).lower(): str(v) for k, v in custom.items() if str(k).lower() not in self._config.plans
+            }
+            for code in self.data["custom_plans"]:
+                self.data["plans"].setdefault(code, False)
         for key, value in saved.items():
-            if key not in self.data:
+            if key not in self.data or key == "custom_plans":
                 continue
             if isinstance(self.data[key], dict) and isinstance(value, dict) and key in ("plans", "notify"):
                 for sub, flag in value.items():
@@ -77,6 +86,8 @@ class State:
             d["mode"] = self._config.default_mode
         if d["interval"] not in INTERVAL_CHOICES:
             d["interval"] = min(INTERVAL_CHOICES, key=lambda v: abs(v - int(d["interval"] or 5)))
+        if d["region"] not in REGIONS:
+            d["region"] = self._config.default_region
         if d["speed"] not in SPEEDS:
             d["speed"] = "any"
         d["datacenters"] = [str(dc).lower() for dc in d["datacenters"] or []]
@@ -112,8 +123,33 @@ class State:
     def interval(self) -> int:
         return int(self.data["interval"])
 
+    @property
+    def region(self) -> str:
+        return self.data["region"]
+
+    def all_plans(self) -> dict[str, str]:
+        plans = dict(self._config.plans)
+        plans.update(self.data["custom_plans"])
+        return plans
+
+    def label(self, plan_code: str) -> str:
+        return self.all_plans().get(plan_code, plan_code)
+
     def active_plans(self) -> list[str]:
-        return [code for code in self._config.plans if self.data["plans"].get(code)]
+        return [code for code in self.all_plans() if self.data["plans"].get(code)]
+
+    def toggle_plan(self, plan_code: str, label: str | None = None) -> bool:
+        plan_code = plan_code.lower()
+        if plan_code in self._config.plans:
+            self.data["plans"][plan_code] = not self.data["plans"].get(plan_code, False)
+            return self.data["plans"][plan_code]
+        if plan_code in self.data["custom_plans"]:
+            del self.data["custom_plans"][plan_code]
+            self.data["plans"].pop(plan_code, None)
+            return False
+        self.data["custom_plans"][plan_code] = label or plan_code
+        self.data["plans"][plan_code] = True
+        return True
 
     def notify_on(self, key: str) -> bool:
         return bool(self.data["notify"].get(key, True))
